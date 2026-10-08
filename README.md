@@ -146,29 +146,34 @@ If the Cloud Admin granted you `roles/editor` + `roles/resourcemanager.projectIa
 
 ---
 
-### Step 2.2: Enable Project GCP APIs (`*.googleapis.com`)
+### Step 2.2: Enable Project GCP APIs (`*.googleapis.com`) & Default VPC Network
 
-From your operator account, enable all required GCP APIs for your deployment tier (`vm`, `cloudrun`, `hybrid`, `ha`, or `all`):
+From your operator account, enable all required GCP APIs for your deployment tier (`vm`, `cloudrun`, `hybrid`, `ha`, or `all`). The script automatically batches calls into chunks of `<= 15` services to stay within GCP Service Usage's 20-service batch limit (`SU_MAX_BATCH_SIZE_EXCEEDED`).
+
+Pass `--ensure-default-network` if your organization enforces `constraints/compute.skipDefaultNetworkCreation` (which skips auto-creating the `default` VPC network required by `scripts/single-node-vm/deploy.sh`):
 
 ```bash
 ./scripts/enable-apis.sh \
   --project <GCP_PROJECT_ID> \
-  --tier all
+  --tier all \
+  --ensure-default-network
 ```
 
-#### Table 2.1: GCP APIs Enabled by Tier
+#### Table 2.1: GCP APIs Enabled by Tier (21 Services)
 
 | GCP Service API | Required By Tier | Purpose in Scion |
 | :--- | :--- | :--- |
+| `serviceusage.googleapis.com` | All | Enables and inspects GCP service APIs and quotas on the project. |
+| `cloudresourcemanager.googleapis.com` | All | Project metadata resolution and project-level IAM policy bindings. |
+| `iam.googleapis.com` | All | Service Account creation, Hub SA minting (`IAMAdminClient`), and SA IAM policies. |
+| `iamcredentials.googleapis.com` | All | Short-lived token generation (`generateAccessToken`, `generateIdToken`) & `signBlob` for GCS signed URLs. |
 | `compute.googleapis.com` | All | GCE VMs, VPC networks, subnets, Cloud Router/NAT, firewall rules. |
 | `run.googleapis.com` | All | Hub Cloud Run service, Single-Node VM IAP proxy, or Cloud Run Sandbox. |
 | `iap.googleapis.com` | All | Identity-Aware Proxy authentication for Web UI, CLI, and agent transport tokens. |
+| `cloudbuild.googleapis.com` | All | Checked by Single-Node VM and Cloud Run deployment scripts during image/source setup. |
 | `secretmanager.googleapis.com` | All | Dynamic storage for User, Project, and Hub secrets (`scion-<hub_hash>-*`). |
 | `storage.googleapis.com` | All | GCS bucket storage for agent templates, workspaces, and artifacts. |
-| `artifactregistry.googleapis.com` | All | Container image registry for Scion Hub and agent harness images. |
-| `iam.googleapis.com` | All | Service Account creation, Hub SA minting (`IAMAdminClient`), and SA IAM policies. |
-| `iamcredentials.googleapis.com` | All | Short-lived token generation (`generateAccessToken`, `generateIdToken`) & `signBlob` for GCS signed URLs. |
-| `cloudresourcemanager.googleapis.com` | All | Project metadata resolution and project-level IAM policy bindings. |
+| `artifactregistry.googleapis.com` | All | Container image registry for Scion Hub, IAP proxy, and agent harness images. |
 | `aiplatform.googleapis.com` | All (Vertex AI) | Vertex AI & Model Garden inference endpoints (Gemini, Claude on Vertex). |
 | `policytroubleshooter.googleapis.com` | All (`enforce`/`log`) | Policy Troubleshooter API v3 used by Hub to verify caller `iam.serviceAccounts.actAs` permissions. |
 | `logging.googleapis.com` | All | Cloud Logging for Hub, Runtime Broker, and agent containers. |
@@ -261,7 +266,7 @@ scion hub env set --scope hub --always GOOGLE_CLOUD_REGION=us-east5
 | :--- | :--- | :--- | :--- | :--- |
 | **A. Hub-Minted SAs**<br>(`scion hub gcp-accounts mint`) | `iam.googleapis.com`<br>`iamcredentials.googleapis.com` | **`roles/iam.serviceAccountAdmin`** on the Hub's GCP project (`--enable-minting`) | • **Caller in Scion:** Project Owner/Admin or Hub Admin.<br>• **Minted SA:** Created with **zero project roles**! | The Hub creates `scion-<slug>@<project>.iam.gserviceaccount.com` and binds:<br>1. `roles/iam.serviceAccountTokenCreator` for the **Hub SA**<br>2. `roles/iam.serviceAccountUser` (`actAs`) for the **minted SA on itself**.<br>⚠️ **Operator Action:** After minting an SA in Scion, grant it `roles/aiplatform.user` on the project via `./scripts/grant-runtime-sa-iam.sh --agent-sa <minted-sa> --grant-vertex-ai`. |
 | **B. Bring-Your-Own SA (BYOSA)**<br>(`assign` mode) | `iamcredentials.googleapis.com` | **`roles/iam.serviceAccountTokenCreator`** bound **on the target Agent SA** (`--agent-sa`) | Target Agent SA holds `roles/aiplatform.user` (and any project roles) on its GCP project. | The Hub verifies impersonation via `generateAccessToken` and mints short-lived access/OIDC tokens on demand for the agent container's `sciontool` metadata server (`POST /api/v1/agent/gcp-token`). |
-| **C. Enforced `actAs` Delegation**<br>(`gcp_iam_check_mode: enforce`) | `policytroubleshooter.googleapis.com` | **`roles/iam.securityReviewer`** on the GCP Project or Org (`--enable-enforce-check`) | **Human User (`user:...`) or Parent Agent SA** must hold **`roles/iam.serviceAccountUser`** (`iam.serviceAccounts.actAs`) on the target Agent SA (`--allow-user-act-as`). | Before allowing a user to attach a GCP SA to a project or launch an agent with it, the Hub calls Policy Troubleshooter v3 to verify the caller has `iam.serviceAccounts.actAs` on that SA. **Fails closed** if the Hub SA lacks `roles/iam.securityReviewer`. |
+| **C. Enforced `actAs` Delegation**<br>(`gcp_iam_check_mode: enforce`) | `policytroubleshooter.googleapis.com` | **`roles/iam.securityReviewer`** on the GCP Project (`--enable-enforce-check`), or at the Organization level | **Human User (`user:...`) or Parent Agent SA** must hold **`roles/iam.serviceAccountUser`** (`iam.serviceAccounts.actAs`) on the target Agent SA (`--allow-user-act-as`). | Before allowing a user to attach a GCP SA to a project or launch an agent with it, the Hub calls Policy Troubleshooter v3 to verify the caller has `iam.serviceAccounts.actAs` on that SA.<br>• **Project-level vs. Org-level `securityReviewer`:** When granted only at the Project level, Policy Troubleshooter v3 returns `overallAccessState: UNKNOWN_INFO` (`allowAccessState: ALLOW_ACCESS_STATE_GRANTED`, `denyAccessState: DENY_ACCESS_STATE_UNKNOWN_INFO`) because Org-level IAM Deny policies cannot be read. Scion's `PolicyTroubleshooterChecker` allows this by default (`denyUnknownFailOpen: true`); if you set `denyUnknownFailOpen: false`, the Hub SA must hold `roles/iam.securityReviewer` at the Organization level. |
 
 ---
 
