@@ -278,3 +278,19 @@ When onboarding additional developers to use the deployed Scion Hub, grant them:
 | :--- | :--- | :--- |
 | `roles/iap.httpsResourceAccessor` | IAP Web Service / Cloud Run Service | Log into the Scion Web UI and authenticate `scion` CLI commands through IAP. |
 | `roles/iam.serviceAccountUser` (`iam.serviceAccounts.actAs`) | Target Agent SA *(Only if `gcp_iam_check_mode: enforce`)* | Required to register a BYOSA, set it as a project default, or launch an agent with it when IAM `actAs` enforcement is enabled. |
+
+---
+
+## End-to-End Verification
+
+Every role, API, Service Account binding, Policy Troubleshooter v3 check, and Vertex AI inference path in this guide has been verified end-to-end on a fresh GCP project using a dedicated non-Owner operator identity (`roles/editor` + `roles/resourcemanager.projectIamAdmin` only).
+
+- **Full Verification Report & Sanitized Transcript:** [`docs/e2e-verification-report.md`](docs/e2e-verification-report.md)
+- **Automated E2E Verification Script:** [`scripts/verify-e2e.sh`](scripts/verify-e2e.sh)
+
+```bash
+./scripts/verify-e2e.sh \
+  --project <GCP_PROJECT_ID> \
+  --admin-email <admin@example.com> \
+  --scion-repo /path/to/scion
+```
