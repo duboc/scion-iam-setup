@@ -28,6 +28,23 @@ flowchart LR
 
 ---
 
+## Pre-Flight Check: Validate Your Permissions (`validate-permissions.sh`)
+
+Before running any deployment or filing an IAM request, run [`scripts/validate-permissions.sh`](scripts/validate-permissions.sh) (100% read-only, no Scion repo required, creates no resources) to check whether your current `gcloud` account already has what is needed:
+
+```bash
+# Check if you have the Phase 1 bootstrap permissions (Option 1A: editor + projectIamAdmin)
+./scripts/validate-permissions.sh --project <GCP_PROJECT_ID> --tier phase1-bootstrap
+
+# Check if you have all permissions and enabled APIs for a specific tier (vm, hybrid, cloudrun, ha-gcloud, ha-terraform, or full-operator)
+./scripts/validate-permissions.sh --project <GCP_PROJECT_ID> --tier full-operator --check-apis
+```
+
+- If you already hold `resourcemanager.projects.setIamPolicy` (Option 1A) and are only missing additive roles, `validate-permissions.sh` prints the exact `./scripts/grant-deployer-iam.sh` command you can run **yourself** to self-grant them.
+- If you do not hold `resourcemanager.projects.setIamPolicy`, it prints the exact **Phase 1** commands to send to your Cloud Admin.
+
+---
+
 ## Phase 1 — What the Operator Must Request to Get Started
 
 ### Why `roles/editor` Alone Is Never Enough
