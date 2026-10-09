@@ -118,22 +118,34 @@ BASE_BOOTSTRAP_ENTRIES=(
 
 VM_ENTRIES=(
   "compute.instances.create|roles/editor|Create GCE Hub VM"
-  "compute.networks.create|roles/editor or roles/compute.networkAdmin|Create VPC network"
-  "compute.subnetworks.create|roles/editor or roles/compute.networkAdmin|Create VPC subnetwork"
+  "compute.networks.get|roles/editor or roles/compute.networkAdmin|Inspect VPC network (<PROJECT_ID>)"
+  "compute.networks.create|roles/editor or roles/compute.networkAdmin|Create VPC network (<PROJECT_ID>)"
+  "compute.networks.updatePolicy|roles/editor or roles/compute.networkAdmin|Attach/modify firewall policies on VPC network"
+  "compute.subnetworks.get|roles/editor or roles/compute.networkAdmin|Inspect regional subnet CIDR for Direct VPC Egress"
+  "compute.subnetworks.list|roles/editor or roles/compute.networkAdmin|List regional subnets on VPC network"
+  "compute.subnetworks.create|roles/editor or roles/compute.networkAdmin|Create regional VPC subnetwork"
+  "compute.subnetworks.use|roles/editor or roles/compute.networkUser|Attach Cloud Run Direct VPC Egress & GCE VM to subnet"
   "compute.routers.create|roles/editor or roles/compute.networkAdmin|Create Cloud Router & Cloud NAT"
-  "compute.firewalls.create|roles/editor or roles/compute.networkAdmin|Create VPC firewall rules"
+  "compute.firewalls.get|roles/editor or roles/compute.networkAdmin|Inspect IAP SSH & Direct VPC proxy firewall rules"
+  "compute.firewalls.list|roles/editor or roles/compute.networkAdmin|List VPC firewall rules"
+  "compute.firewalls.create|roles/editor or roles/compute.networkAdmin|Create IAP SSH (tcp:22) & Direct VPC proxy (tcp:8080) firewall rules"
+  "compute.firewalls.update|roles/editor or roles/compute.networkAdmin|Update VPC firewall rules"
+  "compute.firewalls.delete|roles/editor or roles/compute.networkAdmin|Delete/sanitize VPC firewall rules on failure or teardown"
   "artifactregistry.repositories.create|roles/editor|Create Artifact Registry repository"
   "run.services.create|roles/editor or roles/run.admin|Deploy Cloud Run IAP proxy / Hub service"
+  "run.services.update|roles/editor or roles/run.admin|Update Cloud Run IAP proxy / Hub service"
+  "run.services.get|roles/editor or roles/run.admin|Inspect Cloud Run service URL & status"
   "run.services.getIamPolicy|roles/run.admin|Read Cloud Run service IAM policy"
-  "run.services.setIamPolicy|roles/run.admin|Grant roles/run.invoker on Cloud Run service"
+  "run.services.setIamPolicy|roles/run.admin|Grant roles/run.invoker on Cloud Run service to IAP SA"
+  "iap.web.setIamPolicy|roles/iap.admin|Configure IAP web policy"
+  "iap.webServices.setIamPolicy|roles/iap.admin|Bind roles/iap.httpsResourceAccessor on Cloud Run IAP proxy"
+  "iap.tunnelInstances.accessViaIAP|roles/iap.tunnelResourceAccessor|SSH into private GCE VMs via IAP TCP tunnel"
   "aiplatform.endpoints.predict|roles/aiplatform.user or roles/aiplatform.admin|Invoke Vertex AI / Model Garden endpoints"
 )
 
 HYBRID_EXTRA_ENTRIES=(
   "iam.serviceAccounts.getIamPolicy|roles/iam.serviceAccountAdmin|Read Service Account IAM policy"
   "iam.serviceAccounts.setIamPolicy|roles/iam.serviceAccountAdmin|Bind tokenCreator / Workload Identity on Service Accounts"
-  "iap.web.setIamPolicy|roles/iap.admin|Configure IAP web policy"
-  "iap.webServices.setIamPolicy|roles/iap.admin|Bind roles/iap.httpsResourceAccessor on Cloud Run IAP"
   "container.clusters.create|roles/editor or roles/container.admin|Create/manage GKE clusters"
 )
 
@@ -148,7 +160,6 @@ HA_TERRAFORM_EXTRA_ENTRIES=(
 FULL_OPERATOR_EXTRA_ENTRIES=(
   "iam.roles.get|roles/iam.securityReviewer|Inspect IAM role definitions & Policy Troubleshooter"
   "iap.webServiceVersions.accessViaIAP|roles/iap.httpsResourceAccessor|Log into IAP-protected Scion Web UI & CLI (not in roles/owner!)"
-  "iap.tunnelInstances.accessViaIAP|roles/iap.tunnelResourceAccessor|SSH into private GCE VMs via IAP TCP tunnel"
 )
 
 ENTRIES=("${BASE_BOOTSTRAP_ENTRIES[@]}")

@@ -103,7 +103,7 @@ If your organization prohibits granting `roles/resourcemanager.projectIamAdmin` 
 | **`roles/iap.httpsResourceAccessor`** | `iap.webServiceVersions.accessViaIAP` | **Critical for operator login:** Allows the operator themselves to pass through IAP to open the Scion Web UI and run `scion` CLI commands against the Hub. |
 | **`roles/iap.tunnelResourceAccessor`** | `iap.tunnelInstances.accessViaIAP` | Allows the operator to SSH into private Single-Node / Hybrid GCE VMs via `gcloud compute ssh --tunnel-through-iap`. |
 | **`roles/secretmanager.admin`** | `secretmanager.secrets.create`<br>`secretmanager.secrets.setIamPolicy`<br>`secretmanager.versions.add` | Creates secrets and sets per-secret IAM bindings (`google_secret_manager_secret_iam_member` in Terraform HA requires `secretmanager.secrets.setIamPolicy`, which `editor` lacks). |
-| **`roles/compute.networkAdmin`** | `compute.networks.*`, `compute.subnetworks.*`, `compute.routers.*`, `compute.firewalls.*` | Creates and modifies VPCs, subnets, Cloud Router, Cloud NAT, and firewall rules. |
+| **`roles/compute.networkAdmin`** | `compute.networks.get`, `compute.networks.create`, `compute.networks.updatePolicy`, `compute.subnetworks.get`, `compute.subnetworks.list`, `compute.subnetworks.create`, `compute.subnetworks.use`, `compute.routers.*`, `compute.firewalls.get`, `compute.firewalls.list`, `compute.firewalls.create`, `compute.firewalls.update`, `compute.firewalls.delete` | Creates and modifies VPCs (`<GCP_PROJECT_ID>`), regional subnets, Cloud Router/NAT, Direct VPC Egress attachments (`compute.subnetworks.use`), and VPC firewall rules (`compute.networks.updatePolicy` + `compute.firewalls.*`). |
 | **`roles/servicenetworking.networksAdmin`** | `servicenetworking.services.addPeering` | Establishes Private Service Access VPC peering for private Cloud SQL and Cloud Filestore instances. |
 | **`roles/container.admin`** | `container.clusters.*`, `container.pods.*`, Kubernetes RBAC admin | Creates GKE Autopilot clusters, binds K8s RBAC (`ClusterRole`/`RoleBinding`), and allows the operator to run `kubectl` against agent pods. |
 | **`roles/storage.admin`** | `storage.buckets.create`<br>`storage.buckets.setIamPolicy`<br>`storage.objects.*` | Creates GCS buckets for Scion templates/workspaces and binds bucket-level IAM policies. |
@@ -116,16 +116,16 @@ If your organization prohibits granting `roles/resourcemanager.projectIamAdmin` 
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | `roles/resourcemanager.projectIamAdmin` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `roles/run.admin` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `roles/iap.admin` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `roles/compute.networkAdmin` | ✅ | ✅ | — | — | ✅ | ✅ |
 | `roles/iam.serviceAccountAdmin` | — | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `roles/iap.admin` | — | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `roles/iam.serviceAccountUser` | *(in editor)* | *(in editor)* | ✅ | ✅ | *(in editor)* | ✅ |
 | `roles/secretmanager.admin` | — | — | — | — | ✅ | ✅ |
-| `roles/compute.networkAdmin` | — | — | — | — | ✅ | ✅ |
 | `roles/servicenetworking.networksAdmin` | — | — | — | — | ✅ | ✅ |
 | `roles/container.admin` | — | *(in editor)* | — | *(in editor)* | ✅ | ✅ |
 | `roles/storage.admin` | — | — | — | — | ✅ | ✅ |
-| `roles/iap.httpsResourceAccessor` | Recommended | Recommended | Recommended | Recommended | Recommended | ✅ |
-| `roles/iap.tunnelResourceAccessor` | Recommended | Recommended | — | — | — | ✅ |
+| `roles/iap.httpsResourceAccessor` | ✅ | ✅ | Recommended | Recommended | Recommended | ✅ |
+| `roles/iap.tunnelResourceAccessor` | ✅ | ✅ | — | — | — | ✅ |
 | `roles/aiplatform.admin` | Recommended | Recommended | Recommended | Recommended | Recommended | ✅ |
 | `roles/iam.securityReviewer` | Optional | Optional | Optional | Optional | Optional | ✅ |
 
@@ -163,13 +163,14 @@ If the Cloud Admin granted you `roles/editor` + `roles/resourcemanager.projectIa
 
 ---
 
-### Step 2.2: Enable Project GCP APIs (`*.googleapis.com`), Project VPC (`<GCP_PROJECT_ID>`) & IAP SSH Firewall Rule
+### Step 2.2: Enable Project GCP APIs (`*.googleapis.com`), Project VPC (`<GCP_PROJECT_ID>`) & Direct VPC / IAP Firewall Rules
 
 From your operator account, enable all required GCP APIs for your deployment tier (`vm`, `cloudrun`, `hybrid`, `ha`, or `all`). The script automatically batches calls into chunks of `<= 15` services to stay within GCP Service Usage's 20-service batch limit (`SU_MAX_BATCH_SIZE_EXCEEDED`).
 
 Pass `--ensure-vpc` so the script inspects `<GCP_PROJECT_ID>` and ensures:
 1. A VPC network named **`<GCP_PROJECT_ID>`** (rather than `default`) and its regional subnet exist.
 2. The IAP TCP forwarding firewall rule **`<GCP_PROJECT_ID>-allow-iap-ssh`** (`35.235.240.0/20` → `tcp:22`) is applied on network `<GCP_PROJECT_ID>` so `gcloud compute ssh --tunnel-through-iap` succeeds during VM setup.
+3. The Cloud Run Direct VPC Egress firewall rule **`<GCP_PROJECT_ID>-allow-proxy`** (`<SUBNET_CIDR>` → `tcp:8080`) is applied on network `<GCP_PROJECT_ID>` so the Cloud Run IAP proxy (`--network=<GCP_PROJECT_ID> --subnet=<SUBNET> --vpc-egress=all-traffic`) can reach the private Hub VM on port `8080` (since custom VPCs do not include a `default-allow-internal` rule).
 
 ```bash
 ./scripts/enable-apis.sh \
@@ -177,6 +178,16 @@ Pass `--ensure-vpc` so the script inspects `<GCP_PROJECT_ID>` and ensures:
   --tier all \
   --ensure-vpc
 ```
+
+#### Table 2.1a: Required VPC Firewall Rules & Direct VPC Egress Permissions (Cloud Run IAP Proxy → Hub VM)
+
+| Layer / Principal | Rule or Permission | Source / Scope | Target / Port | Why It Is Required |
+| :--- | :--- | :--- | :--- | :--- |
+| **VPC Firewall Rule (`INGRESS`)** | `scion-hub-<hub>-allow-proxy` / `<GCP_PROJECT_ID>-allow-proxy` | Regional Subnet CIDR (e.g. `10.128.0.0/20`) on VPC `<GCP_PROJECT_ID>` | `tcp:8080` (`--target-tags=scion-hub-<hub>`) | Cloud Run Direct VPC Egress allocates internal IPs from `--subnet=<SUBNET>`. Allows the IAP proxy to forward HTTP/WebSocket traffic to `http://<VM_IP>:8080`. |
+| **VPC Firewall Rule (`INGRESS`)** | `scion-hub-<hub>-allow-iap-ssh` / `<GCP_PROJECT_ID>-allow-iap-ssh` | `35.235.240.0/20` *(Google IAP TCP range)* | `tcp:22` (`--target-tags=scion-hub-<hub>`) | Allows `gcloud compute ssh --tunnel-through-iap` to reach the `--no-address` Hub VM during setup and maintenance. |
+| **Operator / Deployer IAM** | `compute.firewalls.{get,list,create,update,delete}`<br>`compute.networks.{get,create,updatePolicy}`<br>`compute.subnetworks.{get,list,create,use}` | Project (`roles/compute.networkAdmin` or `roles/editor`) | VPC `<GCP_PROJECT_ID>` & Regional Subnet | `compute.networks.updatePolicy` is required to attach/update firewall rules on the VPC; `compute.subnetworks.use` is required to attach Cloud Run Direct VPC Egress and the GCE VM to the subnet. |
+| **Cloud Run Service Agent** | `service-<PROJECT_NUMBER>@serverless-robot-prod.iam.gserviceaccount.com` | Project (`roles/run.serviceAgent`; or `roles/compute.networkUser` on Shared VPC) | Regional Subnet | Leases `/26` internal IP blocks from `<SUBNET>` (`compute.subnetworks.use`, `compute.addresses.*`) for Cloud Run Direct VPC Egress instances. |
+| **IAP Service Agent** | `service-<PROJECT_NUMBER>@gcp-sa-iap.iam.gserviceaccount.com` | Cloud Run Proxy Service (`roles/run.invoker`) | `<hub>-iap-proxy` | Allows Google Identity-Aware Proxy to invoke the Cloud Run proxy service after authenticating end-user HTTPS requests. |
 
 #### Table 2.1: GCP APIs Enabled by Tier (21 Services)
 

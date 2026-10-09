@@ -30,8 +30,9 @@ Options:
   --project <id>             Target GCP Project ID (required)
   --tier <tier>              Deployment tier (default: all)
   --ensure-vpc               Inspect <GCP_PROJECT_ID> and ensure VPC network '<GCP_PROJECT_ID>'
-                             (not 'default'), regional subnet, and IAP SSH firewall rule
-                             (35.235.240.0/20 -> tcp:22) exist
+                             (not 'default'), regional subnet, IAP SSH firewall rule
+                             (35.235.240.0/20 -> tcp:22), and Cloud Run Direct VPC Egress
+                             proxy firewall rule (<SUBNET_CIDR> -> tcp:8080) exist
   --ensure-default-network   Alias for --ensure-vpc
   --region <region>          Region for subnet verification when --ensure-vpc is set (default: us-central1)
   --dry-run                  Print the gcloud commands without executing them
@@ -140,6 +141,7 @@ BATCH_SIZE=15
 TOTAL_APIS="${#APIS[@]}"
 VPC_NAME="${PROJECT_ID}"
 IAP_FW_RULE="${VPC_NAME}-allow-iap-ssh"
+PROXY_FW_RULE="${VPC_NAME}-allow-proxy"
 
 if [[ "${DRY_RUN}" == "true" ]]; then
   echo ""
@@ -153,6 +155,7 @@ if [[ "${DRY_RUN}" == "true" ]]; then
   if [[ "${ENSURE_VPC}" == "true" ]]; then
     echo "  gcloud compute networks describe ${VPC_NAME} --project=${PROJECT_ID} || gcloud compute networks create ${VPC_NAME} --project=${PROJECT_ID} --subnet-mode=auto"
     echo "  gcloud compute firewall-rules describe ${IAP_FW_RULE} --project=${PROJECT_ID} || gcloud compute firewall-rules create ${IAP_FW_RULE} --project=${PROJECT_ID} --network=${VPC_NAME} --direction=INGRESS --action=ALLOW --rules=tcp:22 --source-ranges=35.235.240.0/20"
+    echo "  gcloud compute firewall-rules describe ${PROXY_FW_RULE} --project=${PROJECT_ID} || gcloud compute firewall-rules create ${PROXY_FW_RULE} --project=${PROJECT_ID} --network=${VPC_NAME} --direction=INGRESS --action=ALLOW --rules=tcp:8080 --source-ranges=<SUBNET_CIDR>"
   fi
   exit 0
 fi
@@ -185,24 +188,37 @@ if [[ "${ENSURE_VPC}" == "true" ]]; then
   fi
 
   # Ensure a regional subnet exists in REGION on VPC_NAME (for custom-mode networks)
-  EXISTING_SUBNET="$(gcloud compute networks subnets list \
+  SUBNET_NAME="$(gcloud compute networks subnets list \
     "--project=${PROJECT_ID}" \
     "--regions=${REGION}" \
     "--filter=network ~ /networks/${VPC_NAME}$" \
     --format="value(name)" 2>/dev/null | head -1 || true)"
-  if [[ -z "${EXISTING_SUBNET}" ]]; then
-    echo "    Creating regional subnet '${VPC_NAME}' in '${REGION}' on network '${VPC_NAME}'..."
-    gcloud compute networks subnets create "${VPC_NAME}" \
+  if [[ -z "${SUBNET_NAME}" ]]; then
+    SUBNET_NAME="${VPC_NAME}"
+    echo "    Creating regional subnet '${SUBNET_NAME}' in '${REGION}' on network '${VPC_NAME}'..."
+    gcloud compute networks subnets create "${SUBNET_NAME}" \
       "--project=${PROJECT_ID}" \
       "--network=${VPC_NAME}" \
       "--region=${REGION}" \
       --range="10.128.0.0/20" \
       --quiet
   else
-    echo "    Found regional subnet '${EXISTING_SUBNET}' in '${REGION}' on network '${VPC_NAME}'."
+    echo "    Found regional subnet '${SUBNET_NAME}' in '${REGION}' on network '${VPC_NAME}'."
   fi
 
+  SUBNET_CIDR="$(gcloud compute networks subnets describe "${SUBNET_NAME}" \
+    "--region=${REGION}" "--project=${PROJECT_ID}" \
+    --format="value(ipCidrRange)" 2>/dev/null || echo "10.128.0.0/20")"
+  [[ -z "${SUBNET_CIDR}" ]] && SUBNET_CIDR="10.128.0.0/20"
+  echo "    Regional subnet '${SUBNET_NAME}' CIDR (${REGION}): ${SUBNET_CIDR}"
+
   echo "==> Ensuring IAP SSH firewall rule '${IAP_FW_RULE}' (35.235.240.0/20 -> tcp:22) on network '${VPC_NAME}'..."
+  if EXISTING_IAP_NET="$(gcloud compute firewall-rules describe "${IAP_FW_RULE}" "--project=${PROJECT_ID}" --format="value(network)" 2>/dev/null)"; then
+    if [[ -n "${EXISTING_IAP_NET}" && "${EXISTING_IAP_NET}" != *"/${VPC_NAME}" && "${EXISTING_IAP_NET}" != "${VPC_NAME}" ]]; then
+      echo "    Firewall rule '${IAP_FW_RULE}' is attached to '${EXISTING_IAP_NET##*/}'; recreating on '${VPC_NAME}'..."
+      gcloud compute firewall-rules delete "${IAP_FW_RULE}" "--project=${PROJECT_ID}" --quiet
+    fi
+  fi
   if gcloud compute firewall-rules describe "${IAP_FW_RULE}" "--project=${PROJECT_ID}" --quiet &>/dev/null; then
     gcloud compute firewall-rules update "${IAP_FW_RULE}" \
       "--project=${PROJECT_ID}" \
@@ -221,6 +237,33 @@ if [[ "${ENSURE_VPC}" == "true" ]]; then
       --description="Allow IAP TCP forwarding for SSH on network ${VPC_NAME}" \
       --quiet
     echo "    Created firewall rule '${IAP_FW_RULE}' on network '${VPC_NAME}'."
+  fi
+
+  echo "==> Ensuring Cloud Run Direct VPC Egress proxy firewall rule '${PROXY_FW_RULE}' (${SUBNET_CIDR} -> tcp:8080) on network '${VPC_NAME}'..."
+  if EXISTING_PROXY_NET="$(gcloud compute firewall-rules describe "${PROXY_FW_RULE}" "--project=${PROJECT_ID}" --format="value(network)" 2>/dev/null)"; then
+    if [[ -n "${EXISTING_PROXY_NET}" && "${EXISTING_PROXY_NET}" != *"/${VPC_NAME}" && "${EXISTING_PROXY_NET}" != "${VPC_NAME}" ]]; then
+      echo "    Firewall rule '${PROXY_FW_RULE}' is attached to '${EXISTING_PROXY_NET##*/}'; recreating on '${VPC_NAME}'..."
+      gcloud compute firewall-rules delete "${PROXY_FW_RULE}" "--project=${PROJECT_ID}" --quiet
+    fi
+  fi
+  if gcloud compute firewall-rules describe "${PROXY_FW_RULE}" "--project=${PROJECT_ID}" --quiet &>/dev/null; then
+    gcloud compute firewall-rules update "${PROXY_FW_RULE}" \
+      "--project=${PROJECT_ID}" \
+      --rules=tcp:8080 \
+      --source-ranges="${SUBNET_CIDR}" \
+      --quiet
+    echo "    Verified/updated firewall rule '${PROXY_FW_RULE}' on network '${VPC_NAME}'."
+  else
+    gcloud compute firewall-rules create "${PROXY_FW_RULE}" \
+      "--project=${PROJECT_ID}" \
+      "--network=${VPC_NAME}" \
+      --direction=INGRESS \
+      --action=ALLOW \
+      --rules=tcp:8080 \
+      --source-ranges="${SUBNET_CIDR}" \
+      --description="Allow Cloud Run Direct VPC Egress IAP proxy to reach Scion Hub VM on tcp:8080" \
+      --quiet
+    echo "    Created firewall rule '${PROXY_FW_RULE}' on network '${VPC_NAME}'."
   fi
 fi
 

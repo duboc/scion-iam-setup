@@ -98,6 +98,10 @@ case "${TIER}" in
     ROLES+=(
       "roles/resourcemanager.projectIamAdmin"
       "roles/run.admin"
+      "roles/iap.admin"
+      "roles/iap.httpsResourceAccessor"
+      "roles/iap.tunnelResourceAccessor"
+      "roles/compute.networkAdmin"
     )
     ;;
   hybrid)
@@ -106,6 +110,9 @@ case "${TIER}" in
       "roles/run.admin"
       "roles/iam.serviceAccountAdmin"
       "roles/iap.admin"
+      "roles/iap.httpsResourceAccessor"
+      "roles/iap.tunnelResourceAccessor"
+      "roles/compute.networkAdmin"
     )
     ;;
   cloudrun|ha-gcloud)
