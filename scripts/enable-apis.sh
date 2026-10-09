@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
-# Enable required GCP APIs for Scion deployments and runtime features.
+# Enable required GCP APIs for Scion deployments and optionally ensure the
+# project VPC network (<PROJECT_ID>) and IAP SSH firewall rule exist.
 set -euo pipefail
 
 PROJECT_ID=""
 TIER="all"
-ENSURE_DEFAULT_NETWORK="false"
+REGION="us-central1"
+ENSURE_VPC="false"
 DRY_RUN="false"
 
 usage() {
   cat <<'EOF'
 Usage:
-  ./scripts/enable-apis.sh --project <GCP_PROJECT_ID> [--tier <vm|cloudrun|hybrid|ha|all>] [--ensure-default-network] [--dry-run]
+  ./scripts/enable-apis.sh \
+    --project <GCP_PROJECT_ID> \
+    [--tier <vm|cloudrun|hybrid|ha|all>] \
+    [--ensure-vpc] \
+    [--region <us-central1>] \
+    [--dry-run]
 
 Tiers:
   vm        Single-Node GCE VM + Cloud Run IAP Proxy + Vertex AI + IAM Minting/Troubleshooting
@@ -22,8 +29,11 @@ Tiers:
 Options:
   --project <id>             Target GCP Project ID (required)
   --tier <tier>              Deployment tier (default: all)
-  --ensure-default-network   Create the auto-mode 'default' VPC network if skipped by org policy
-                             (constraints/compute.skipDefaultNetworkCreation)
+  --ensure-vpc               Inspect <GCP_PROJECT_ID> and ensure VPC network '<GCP_PROJECT_ID>'
+                             (not 'default'), regional subnet, and IAP SSH firewall rule
+                             (35.235.240.0/20 -> tcp:22) exist
+  --ensure-default-network   Alias for --ensure-vpc
+  --region <region>          Region for subnet verification when --ensure-vpc is set (default: us-central1)
   --dry-run                  Print the gcloud commands without executing them
   -h, --help                 Show this help message
 EOF
@@ -39,8 +49,12 @@ while [[ $# -gt 0 ]]; do
       TIER="${2:-}"
       shift 2
       ;;
-    --ensure-default-network)
-      ENSURE_DEFAULT_NETWORK="true"
+    --region)
+      REGION="${2:-}"
+      shift 2
+      ;;
+    --ensure-vpc|--ensure-default-network)
+      ENSURE_VPC="true"
       shift
       ;;
     --dry-run)
@@ -124,6 +138,8 @@ done
 
 BATCH_SIZE=15
 TOTAL_APIS="${#APIS[@]}"
+VPC_NAME="${PROJECT_ID}"
+IAP_FW_RULE="${VPC_NAME}-allow-iap-ssh"
 
 if [[ "${DRY_RUN}" == "true" ]]; then
   echo ""
@@ -134,8 +150,9 @@ if [[ "${DRY_RUN}" == "true" ]]; then
     printf '  %q' "${CMD[@]}"
     echo ""
   done
-  if [[ "${ENSURE_DEFAULT_NETWORK}" == "true" ]]; then
-    echo "  gcloud compute networks describe default --project=${PROJECT_ID} || gcloud compute networks create default --project=${PROJECT_ID} --subnet-mode=auto"
+  if [[ "${ENSURE_VPC}" == "true" ]]; then
+    echo "  gcloud compute networks describe ${VPC_NAME} --project=${PROJECT_ID} || gcloud compute networks create ${VPC_NAME} --project=${PROJECT_ID} --subnet-mode=auto"
+    echo "  gcloud compute firewall-rules describe ${IAP_FW_RULE} --project=${PROJECT_ID} || gcloud compute firewall-rules create ${IAP_FW_RULE} --project=${PROJECT_ID} --network=${VPC_NAME} --direction=INGRESS --action=ALLOW --rules=tcp:22 --source-ranges=35.235.240.0/20"
   fi
   exit 0
 fi
@@ -148,14 +165,62 @@ for ((i = 0; i < TOTAL_APIS; i += BATCH_SIZE)); do
   gcloud services enable "${BATCH[@]}" "--project=${PROJECT_ID}" --quiet
 done
 
-if [[ "${ENSURE_DEFAULT_NETWORK}" == "true" ]]; then
+if [[ "${ENSURE_VPC}" == "true" ]]; then
   echo ""
-  echo "==> Checking for 'default' VPC network..."
-  if gcloud compute networks describe default "--project=${PROJECT_ID}" --quiet &>/dev/null; then
-    echo "    'default' VPC network already exists."
+  echo "==> Inspecting VPC network '${VPC_NAME}' in project '${PROJECT_ID}'..."
+  if gcloud compute networks describe "${VPC_NAME}" "--project=${PROJECT_ID}" --quiet &>/dev/null; then
+    echo "    VPC network '${VPC_NAME}' already exists."
   else
-    echo "    'default' VPC network missing (org policy skipDefaultNetworkCreation). Creating auto-mode 'default' network..."
-    gcloud compute networks create default "--project=${PROJECT_ID}" --subnet-mode=auto --quiet
+    echo "    Creating VPC network '${VPC_NAME}'..."
+    if ! gcloud compute networks create "${VPC_NAME}" "--project=${PROJECT_ID}" --subnet-mode=auto --quiet 2>/dev/null; then
+      echo "    Auto-mode VPC blocked by org policy; creating custom-mode VPC '${VPC_NAME}' + subnet in '${REGION}'..."
+      gcloud compute networks create "${VPC_NAME}" "--project=${PROJECT_ID}" --subnet-mode=custom --quiet
+      gcloud compute networks subnets create "${VPC_NAME}" \
+        "--project=${PROJECT_ID}" \
+        "--network=${VPC_NAME}" \
+        "--region=${REGION}" \
+        --range="10.128.0.0/20" \
+        --quiet
+    fi
+  fi
+
+  # Ensure a regional subnet exists in REGION on VPC_NAME (for custom-mode networks)
+  EXISTING_SUBNET="$(gcloud compute networks subnets list \
+    "--project=${PROJECT_ID}" \
+    "--regions=${REGION}" \
+    "--filter=network ~ /networks/${VPC_NAME}$" \
+    --format="value(name)" 2>/dev/null | head -1 || true)"
+  if [[ -z "${EXISTING_SUBNET}" ]]; then
+    echo "    Creating regional subnet '${VPC_NAME}' in '${REGION}' on network '${VPC_NAME}'..."
+    gcloud compute networks subnets create "${VPC_NAME}" \
+      "--project=${PROJECT_ID}" \
+      "--network=${VPC_NAME}" \
+      "--region=${REGION}" \
+      --range="10.128.0.0/20" \
+      --quiet
+  else
+    echo "    Found regional subnet '${EXISTING_SUBNET}' in '${REGION}' on network '${VPC_NAME}'."
+  fi
+
+  echo "==> Ensuring IAP SSH firewall rule '${IAP_FW_RULE}' (35.235.240.0/20 -> tcp:22) on network '${VPC_NAME}'..."
+  if gcloud compute firewall-rules describe "${IAP_FW_RULE}" "--project=${PROJECT_ID}" --quiet &>/dev/null; then
+    gcloud compute firewall-rules update "${IAP_FW_RULE}" \
+      "--project=${PROJECT_ID}" \
+      --rules=tcp:22 \
+      --source-ranges=35.235.240.0/20 \
+      --quiet
+    echo "    Verified/updated firewall rule '${IAP_FW_RULE}' on network '${VPC_NAME}'."
+  else
+    gcloud compute firewall-rules create "${IAP_FW_RULE}" \
+      "--project=${PROJECT_ID}" \
+      "--network=${VPC_NAME}" \
+      --direction=INGRESS \
+      --action=ALLOW \
+      --rules=tcp:22 \
+      --source-ranges=35.235.240.0/20 \
+      --description="Allow IAP TCP forwarding for SSH on network ${VPC_NAME}" \
+      --quiet
+    echo "    Created firewall rule '${IAP_FW_RULE}' on network '${VPC_NAME}'."
   fi
 fi
 

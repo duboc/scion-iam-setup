@@ -5,7 +5,8 @@
 # This script verifies that a non-Owner operator principal starting ONLY with
 # Option 1A (roles/editor + roles/resourcemanager.projectIamAdmin) can:
 #   1. Self-grant the full-operator IAM bundle (grant-deployer-iam.sh)
-#   2. Enable all 21 required GCP APIs and ensure the default VPC network (enable-apis.sh)
+#   2. Enable all 21 required GCP APIs and ensure the '<PROJECT_ID>' VPC network
+#      + IAP SSH firewall rule (enable-apis.sh --ensure-vpc)
 #   3. Deploy a Single-Node GCE VM + Cloud Run IAP Proxy (scion scripts/single-node-vm/deploy.sh)
 #   4. Wire Hub SA Minting, Policy Troubleshooter v3, and BYO Agent SA IAM (grant-runtime-sa-iam.sh)
 #   5. Execute runtime checks from inside the Hub VM:
@@ -13,6 +14,10 @@
 #      - BYOSA short-lived token generation (iamcredentials.googleapis.com)
 #      - Policy Troubleshooter v3 iam.serviceAccounts.actAs verification
 #      - Live Vertex AI Gemini inference (aiplatform.googleapis.com)
+#
+# Automatic On-Failure Sanitization:
+#   If any step fails, the EXIT trap automatically rolls back / deletes any
+#   resources created during the run unless --no-sanitize-on-failure is set.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,6 +30,7 @@ HUB_NAME="e2e"
 OPERATOR_SA_NAME="operator-e2e"
 BYO_SA_NAME="byo-agent"
 SKIP_VM_DEPLOY="false"
+SANITIZE_ON_FAILURE="true"
 DRY_RUN="false"
 
 usage() {
@@ -37,6 +43,7 @@ Usage:
     [--region <us-central1>] \
     [--hub-name <e2e>] \
     [--skip-vm-deploy] \
+    [--no-sanitize-on-failure] \
     [--dry-run]
 
 Prerequisites:
@@ -46,14 +53,15 @@ Prerequisites:
     (operator-e2e@<GCP_PROJECT_ID>.iam.gserviceaccount.com) with NO roles/owner privileges.
 
 Options:
-  --project <id>         Target GCP Project ID (required)
-  --admin-email <email>  Admin user email for IAP & actAs verification, e.g. admin@example.com (required)
-  --scion-repo <path>    Path to a local checkout of the Scion repository (required unless --skip-vm-deploy)
-  --region <region>      GCP region for resources (default: us-central1)
-  --hub-name <name>      Hub name suffix, <= 20 chars (default: e2e)
-  --skip-vm-deploy       Skip running Scion's deploy.sh if scion-hub-<hub-name> is already deployed
-  --dry-run              Print the verification stages without executing them
-  -h, --help             Show this help message
+  --project <id>             Target GCP Project ID (required)
+  --admin-email <email>      Admin user email for IAP & actAs verification, e.g. admin@example.com (required)
+  --scion-repo <path>        Path to a local checkout of the Scion repository (required unless --skip-vm-deploy)
+  --region <region>          GCP region for resources (default: us-central1)
+  --hub-name <name>          Hub name suffix, <= 20 chars (default: e2e)
+  --skip-vm-deploy           Skip running Scion's deploy.sh if scion-hub-<hub-name> is already deployed
+  --no-sanitize-on-failure   Keep created resources if a step fails (default: sanitize/delete on failure)
+  --dry-run                  Print the verification stages without executing them
+  -h, --help                 Show this help message
 EOF
 }
 
@@ -81,6 +89,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-vm-deploy)
       SKIP_VM_DEPLOY="true"
+      shift
+      ;;
+    --no-sanitize-on-failure)
+      SANITIZE_ON_FAILURE="false"
       shift
       ;;
     --dry-run)
@@ -115,24 +127,51 @@ fi
 OPERATOR_SA="${OPERATOR_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 HUB_SA="scion-hub-${HUB_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 BYO_SA="${BYO_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+MINT_SA="scion-minted-test@${PROJECT_ID}.iam.gserviceaccount.com"
 INSTANCE_NAME="scion-hub-${HUB_NAME}"
 
 if [[ "${DRY_RUN}" == "true" ]]; then
   cat <<EOF
 [DRY-RUN] End-to-End Verification Plan:
   Project ID   : ${PROJECT_ID}
+  VPC Network  : ${PROJECT_ID} (with IAP SSH firewall rule ${PROJECT_ID}-allow-iap-ssh)
   Admin Email  : ${ADMIN_EMAIL}
   Operator SA  : ${OPERATOR_SA} (Starts ONLY with roles/editor + roles/resourcemanager.projectIamAdmin)
   Hub SA       : ${HUB_SA}
   BYO Agent SA : ${BYO_SA}
   VM Instance  : ${INSTANCE_NAME} (${REGION})
+  On Failure   : Sanitize/rollback resources = ${SANITIZE_ON_FAILURE}
 EOF
   exit 0
 fi
 
 TMP_WORK_DIR="$(mktemp -d)"
 chmod 700 "${TMP_WORK_DIR}"
-trap 'rm -rf "${TMP_WORK_DIR}"' EXIT
+DEPLOY_CFG="${TMP_WORK_DIR}/deploy-config.json"
+DEPLOY_STARTED="false"
+
+sanitize_on_exit() {
+  local exit_code=$?
+  set +e
+  if [[ "${exit_code}" -ne 0 && "${SANITIZE_ON_FAILURE}" == "true" ]]; then
+    echo "" >&2
+    echo "===================================================================" >&2
+    echo "ERROR (exit ${exit_code}): Sanitizing created resources in project '${PROJECT_ID}'..." >&2
+    echo "===================================================================" >&2
+    if [[ "${DEPLOY_STARTED}" == "true" && -f "${DEPLOY_CFG}" && -x "${SCION_REPO_DIR}/scripts/single-node-vm/deploy.sh" ]]; then
+      "${SCION_REPO_DIR}/scripts/single-node-vm/deploy.sh" --delete --config "${DEPLOY_CFG}" </dev/null >&2 || true
+    fi
+    for sa in "${MINT_SA}" "${BYO_SA}"; do
+      if gcloud iam service-accounts describe "${sa}" --project="${PROJECT_ID}" &>/dev/null; then
+        gcloud iam service-accounts delete "${sa}" --project="${PROJECT_ID}" --quiet >&2 || true
+      fi
+    done
+    echo "==> Sanitization on failure complete." >&2
+  fi
+  rm -rf "${TMP_WORK_DIR}"
+  exit "${exit_code}"
+}
+trap sanitize_on_exit EXIT
 
 echo "==================================================================="
 echo "Phase 1: Cloud Admin Bootstrap (Option 1A — Minimal 2-Role Grant)"
@@ -200,15 +239,15 @@ echo "--> [2.1] Self-granting full-operator roles via grant-deployer-iam.sh..."
   --member "serviceAccount:${OPERATOR_SA}" \
   --tier full-operator
 
-echo "--> [2.2] Enabling all 21 GCP APIs and ensuring 'default' VPC network..."
+echo "--> [2.2] Enabling all 21 GCP APIs and ensuring VPC '${PROJECT_ID}' + IAP SSH firewall rule..."
 "${SCRIPT_DIR}/enable-apis.sh" \
   --project "${PROJECT_ID}" \
   --tier all \
-  --ensure-default-network
+  --region "${REGION}" \
+  --ensure-vpc
 
 if [[ "${SKIP_VM_DEPLOY}" != "true" ]]; then
   echo "--> [2.4] Deploying Single-Node VM + Cloud Run IAP Proxy as ${OPERATOR_SA}..."
-  DEPLOY_CFG="${TMP_WORK_DIR}/deploy-config.json"
   cat > "${DEPLOY_CFG}" <<EOF
 {
   "hub_name": "${HUB_NAME}",
@@ -227,6 +266,7 @@ if [[ "${SKIP_VM_DEPLOY}" != "true" ]]; then
   "release_channel": "nightly"
 }
 EOF
+  DEPLOY_STARTED="true"
   IAP_ENFORCEMENT_WAIT_SECS=10 "${SCION_REPO_DIR}/scripts/single-node-vm/deploy.sh" \
     --config "${DEPLOY_CFG}"
 fi
@@ -257,6 +297,7 @@ echo "--> [2.5b] Running runtime verification inside ${INSTANCE_NAME} (zone: ${Z
 gcloud compute ssh "${INSTANCE_NAME}" \
   --zone="${ZONE}" \
   --project="${PROJECT_ID}" \
+  --tunnel-through-iap \
   --quiet \
   --command="
     set -euo pipefail

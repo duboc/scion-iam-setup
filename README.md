@@ -163,17 +163,19 @@ If the Cloud Admin granted you `roles/editor` + `roles/resourcemanager.projectIa
 
 ---
 
-### Step 2.2: Enable Project GCP APIs (`*.googleapis.com`) & Default VPC Network
+### Step 2.2: Enable Project GCP APIs (`*.googleapis.com`), Project VPC (`<GCP_PROJECT_ID>`) & IAP SSH Firewall Rule
 
 From your operator account, enable all required GCP APIs for your deployment tier (`vm`, `cloudrun`, `hybrid`, `ha`, or `all`). The script automatically batches calls into chunks of `<= 15` services to stay within GCP Service Usage's 20-service batch limit (`SU_MAX_BATCH_SIZE_EXCEEDED`).
 
-Pass `--ensure-default-network` if your organization enforces `constraints/compute.skipDefaultNetworkCreation` (which skips auto-creating the `default` VPC network required by `scripts/single-node-vm/deploy.sh`):
+Pass `--ensure-vpc` so the script inspects `<GCP_PROJECT_ID>` and ensures:
+1. A VPC network named **`<GCP_PROJECT_ID>`** (rather than `default`) and its regional subnet exist.
+2. The IAP TCP forwarding firewall rule **`<GCP_PROJECT_ID>-allow-iap-ssh`** (`35.235.240.0/20` → `tcp:22`) is applied on network `<GCP_PROJECT_ID>` so `gcloud compute ssh --tunnel-through-iap` succeeds during VM setup.
 
 ```bash
 ./scripts/enable-apis.sh \
   --project <GCP_PROJECT_ID> \
   --tier all \
-  --ensure-default-network
+  --ensure-vpc
 ```
 
 #### Table 2.1: GCP APIs Enabled by Tier (21 Services)

@@ -29,8 +29,8 @@ Because creating a new GCP project automatically grants `roles/owner` to the cre
 | **1.1** | Cloud Admin | Create `<GCP_PROJECT_ID>`, link billing, enable bootstrap IAM APIs (`serviceusage`, `cloudresourcemanager`, `iam`, `iamcredentials`) | Project active; `operator-e2e` SA created | **PASS** |
 | **1.2** | Cloud Admin | Grant **only Option 1A** (`roles/editor` + `roles/resourcemanager.projectIamAdmin`) to `operator-e2e` | `get-iam-policy` shows only `roles/editor` and `roles/resourcemanager.projectIamAdmin` on `operator-e2e` | **PASS** |
 | **2.1** | `operator-e2e` *(Impersonated)* | `./scripts/grant-deployer-iam.sh --project <GCP_PROJECT_ID> --member serviceAccount:operator-e2e@... --tier full-operator` | Operator self-grants all 15 `full-operator` roles using `projectIamAdmin` without `roles/owner` | **PASS** |
-| **2.2** | `operator-e2e` *(Impersonated)* | `./scripts/enable-apis.sh --project <GCP_PROJECT_ID> --tier all --ensure-default-network` | All 21 APIs enabled in batches of `<= 15`; auto-mode `default` VPC network created | **PASS** |
-| **2.4** | `operator-e2e` *(Impersonated)* | Run Scion `scripts/single-node-vm/deploy.sh` | Provisions `scion-hub-e2e` VM, Cloud Router/NAT, firewall rules, `scion-hub.service` (`/healthz` healthy), Artifact Registry repo, and Cloud Run IAP proxy (`--no-allow-unauthenticated --iap`) | **PASS** |
+| **2.2** | `operator-e2e` *(Impersonated)* | `./scripts/enable-apis.sh --project <GCP_PROJECT_ID> --tier all --ensure-vpc` | All 21 APIs enabled in batches of `<= 15`; VPC network `<GCP_PROJECT_ID>`, regional subnet, and IAP SSH firewall rule `<GCP_PROJECT_ID>-allow-iap-ssh` (`35.235.240.0/20` → `tcp:22`) ensured | **PASS** |
+| **2.4** | `operator-e2e` *(Impersonated)* | Run Scion `scripts/single-node-vm/deploy.sh` | Provisions `scion-hub-e2e` VM on VPC `<GCP_PROJECT_ID>`, Cloud Router/NAT, IAP SSH & proxy firewall rules, `scion-hub.service` (`/healthz` healthy), Artifact Registry repo, and Cloud Run IAP proxy (`--no-allow-unauthenticated --iap`); sanitizes created resources automatically on failure | **PASS** |
 | **2.5a** | `operator-e2e` *(Impersonated)* | `./scripts/grant-runtime-sa-iam.sh --project <GCP_PROJECT_ID> --hub-sa scion-hub-e2e@... --enable-minting --enable-enforce-check --agent-sa byo-agent@... --grant-vertex-ai --allow-user-act-as admin@example.com` | Binds `serviceAccountAdmin` & `securityReviewer` to Hub SA; binds `serviceAccountTokenCreator` (Hub SA), `aiplatform.user`, and `serviceAccountUser` (`admin@example.com`) on `byo-agent` | **PASS** |
 | **2.5b** | `scion-hub-e2e` *(Inside Hub VM)* | **Hub SA Minting Test:** Create `scion-minted-test@...` and bind `roles/iam.serviceAccountTokenCreator` (Hub SA) + `roles/iam.serviceAccountUser` (self-`actAs`) | Minted SA created and SA-level IAM policies bound by Hub SA | **PASS** |
 | **2.5c** | `scion-hub-e2e` *(Inside Hub VM)* | **BYOSA Token Impersonation Test:** `gcloud auth print-access-token --impersonate-service-account=byo-agent@...` | Hub SA mints short-lived OAuth2 access token for `byo-agent@...` | **PASS** |
@@ -72,24 +72,26 @@ roles/resourcemanager.projectIamAdmin
 ==> Enabling APIs (in batches of <= 15)...
 --> Enabling batch (1..15 of 21)...
 --> Enabling batch (16..21 of 21)...
-==> Checking for 'default' VPC network...
-    'default' VPC network missing (org policy skipDefaultNetworkCreation). Creating auto-mode 'default' network...
-Created [https://www.googleapis.com/compute/v1/projects/<GCP_PROJECT_ID>/global/networks/default].
+==> Inspecting VPC network '<GCP_PROJECT_ID>' in project '<GCP_PROJECT_ID>'...
+    Creating VPC network '<GCP_PROJECT_ID>'...
+    Found regional subnet '<GCP_PROJECT_ID>' in 'us-central1' on network '<GCP_PROJECT_ID>'.
+==> Ensuring IAP SSH firewall rule '<GCP_PROJECT_ID>-allow-iap-ssh' (35.235.240.0/20 -> tcp:22) on network '<GCP_PROJECT_ID>'...
+    Created firewall rule '<GCP_PROJECT_ID>-allow-iap-ssh' on network '<GCP_PROJECT_ID>'.
 ```
 
 ### Phase 2.4 (Single-Node VM + Cloud Run IAP Proxy Deployment as `operator-e2e`)
 
 ```text
 --- Phase 2: GCP Resources ---
-  Default VPC network found.
+  VPC network ready: <GCP_PROJECT_ID> (subnet: <GCP_PROJECT_ID>)
   Created service account: scion-hub-e2e@<GCP_PROJECT_ID>.iam.gserviceaccount.com
   Roles bound: logging.logWriter, monitoring.metricWriter, cloudtrace.agent, artifactregistry.writer, aiplatform.user
   Created proxy service account: scion-hub-e2e-proxy@<GCP_PROJECT_ID>.iam.gserviceaccount.com
   IAP tunnel access granted to: admin@example.com
   Created Cloud Router: scion-hub-e2e-router
   Created Cloud NAT: scion-hub-e2e-nat
-  Created firewall rule: scion-hub-e2e-allow-iap-ssh (target tags: scion-hub-e2e)
-  Created firewall rule: scion-hub-e2e-allow-proxy (source: 10.128.0.0/20, target tags: scion-hub-e2e)
+  Created firewall rule: scion-hub-e2e-allow-iap-ssh (network: <GCP_PROJECT_ID>, target tags: scion-hub-e2e)
+  Created firewall rule: scion-hub-e2e-allow-proxy (network: <GCP_PROJECT_ID>, source: 10.128.0.0/20, target tags: scion-hub-e2e)
   Created VM: scion-hub-e2e (zone: us-central1-c)
   SSH connection established.
   Cloud-init completed.
@@ -152,8 +154,8 @@ PASS: Vertex AI inference succeeded via BYO Agent SA.
    Passing all 21 required APIs to a single `gcloud services enable` invocation fails with `INVALID_ARGUMENT: Number of services must not exceed the maximum batch size (20)`. [`scripts/enable-apis.sh`](../scripts/enable-apis.sh) now enables services in batches of `<= 15`.
 2. **Bootstrap APIs on Fresh Projects:**
    Before creating or impersonating Service Accounts on a newly created project, `serviceusage.googleapis.com`, `cloudresourcemanager.googleapis.com`, `iam.googleapis.com`, and `iamcredentials.googleapis.com` must be enabled first.
-3. **Hardened Organization `default` VPC Network (`constraints/compute.skipDefaultNetworkCreation`):**
-   Organizations enforcing `skipDefaultNetworkCreation` do not create a `default` VPC network when `compute.googleapis.com` is enabled. Added `--ensure-default-network` to [`scripts/enable-apis.sh`](../scripts/enable-apis.sh).
+3. **Project VPC Network (`<GCP_PROJECT_ID>`) & IAP SSH Firewall Rule (`35.235.240.0/20` → `tcp:22`):**
+   Hardened GCP projects often skip the `default` VPC network (`constraints/compute.skipDefaultNetworkCreation`) and use a VPC network named after `<GCP_PROJECT_ID>`. Both [`scripts/enable-apis.sh`](../scripts/enable-apis.sh) (`--ensure-vpc`) and Scion's `scripts/single-node-vm/deploy.sh` now inspect `<GCP_PROJECT_ID>` to use/create VPC `<GCP_PROJECT_ID>` (and its regional subnet), explicitly configure the IAP TCP forwarding firewall rule (`35.235.240.0/20` → `tcp:22`), pass `--tunnel-through-iap` to all SSH/SCP invocations, and sanitize created resources automatically if deployment fails.
 4. **IAM Propagation Delay on New Service Account Bindings (~20–45s):**
    Newly bound `roles/iam.serviceAccountTokenCreator` policies on freshly created Service Accounts take 20–45 seconds to propagate before `iamcredentials.googleapis.com` (`generateAccessToken`) succeeds.
 5. **Policy Troubleshooter v3 Project-Level vs. Org-Level `roles/iam.securityReviewer`:**
